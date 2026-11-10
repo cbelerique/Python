@@ -1,9 +1,5 @@
-"""On-disk snapshot cache so each hourly run only downloads what is stale.
-
-TSM refreshes realm files every few hours and region stats about daily, and it rate-limits
-heavy downloaders. So we keep parsed snapshots between runs (GitHub Actions cache) and spend
-a small download budget per run on the oldest ones.
-"""
+"""State kept between hourly runs (GitHub Actions cache): auction snapshots, realm map,
+item classes, region stats, and which deals were already sent."""
 
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from .data import RealmRow, RegionRow, Snapshot
+from .data import AuctionHouse, RealmRow, RegionRow, Snapshot
 
 
 def _key(k: tuple[str, int]) -> str:
@@ -23,59 +19,79 @@ def _unkey(s: str) -> tuple[str, int]:
     return kind, int(i)
 
 
-class SnapshotCache:
+def _dt(v):
+    return datetime.fromisoformat(v) if v else None
+
+
+class StateCache:
     def __init__(self, root: Path):
         self.root = root
         (root / "ah").mkdir(parents=True, exist_ok=True)
 
-    # --- realm snapshots -------------------------------------------------
-    def _ah_path(self, slug: str) -> Path:
-        return self.root / "ah" / f"{slug}.json"
-
-    def fetched_at(self, slug: str) -> datetime | None:
+    def _read(self, name: str):
         try:
-            return datetime.fromisoformat(json.loads(self._ah_path(slug).read_text())["fetched_at"])
-        except (OSError, ValueError, KeyError):
-            return None
-
-    def load_ah(self, slug: str) -> Snapshot | None:
-        try:
-            raw = json.loads(self._ah_path(slug).read_text())
+            return json.loads((self.root / name).read_text())
         except (OSError, ValueError):
             return None
-        snap = Snapshot(updated_at=datetime.fromisoformat(raw["updated_at"]) if raw.get("updated_at") else None)
-        for k, (mb, mv) in raw["rows"].items():
-            snap.rows[_unkey(k)] = RealmRow(mb, mv)
-        snap.names = {_unkey(k): v for k, v in raw.get("names", {}).items()}
+
+    def _write(self, name: str, data) -> None:
+        (self.root / name).write_text(json.dumps(data, separators=(",", ":")))
+
+    # ---- auction snapshots -------------------------------------------------
+    def load_ah(self, slug: str) -> Snapshot | None:
+        raw = self._read(f"ah/{slug}.json")
+        if not raw:
+            return None
+        snap = Snapshot(updated_at=_dt(raw.get("updated_at")))
+        for k, v in raw["rows"].items():
+            snap.rows[_unkey(k)] = RealmRow(*v)
         return snap
 
-    def save_ah(self, slug: str, snap: Snapshot, fetched_at: datetime) -> None:
-        raw = {
-            "fetched_at": fetched_at.isoformat(),
+    def save_ah(self, slug: str, snap: Snapshot) -> None:
+        self._write(f"ah/{slug}.json", {
             "updated_at": snap.updated_at.isoformat() if snap.updated_at else None,
-            "rows": {_key(k): [r.min_buyout, r.market_value] for k, r in snap.rows.items()},
-            "names": {_key(k): v for k, v in snap.names.items() if k in snap.rows},
-        }
-        self._ah_path(slug).write_text(json.dumps(raw, separators=(",", ":")))
+            "rows": {_key(k): [r.min_buyout, r.next_buyout, r.count] for k, r in snap.rows.items()},
+        })
 
-    # --- region stats + commodity ids ------------------------------------
+    # ---- connected realms --------------------------------------------------
+    def load_realms(self):
+        raw = self._read("realms.json")
+        if not raw:
+            return None, None
+        return [AuctionHouse(**a) for a in raw["ahs"]], _dt(raw["fetched_at"])
+
+    def save_realms(self, ahs: list[AuctionHouse], fetched_at: datetime) -> None:
+        self._write("realms.json", {
+            "fetched_at": fetched_at.isoformat(),
+            "ahs": [{"id": a.id, "realms": a.realms, "population": a.population} for a in ahs],
+        })
+
+    # ---- item info (class never changes) -----------------------------------
+    def load_items(self) -> dict[str, dict]:
+        return self._read("items.json") or {}
+
+    def save_items(self, items: dict[str, dict]) -> None:
+        self._write("items.json", items)
+
+    # ---- region stats ------------------------------------------------------
     def load_region(self):
-        try:
-            raw = json.loads((self.root / "region.json").read_text())
-        except (OSError, ValueError):
+        raw = self._read("region.json")
+        if not raw:
             return None
         region = {_unkey(k): RegionRow(*v) for k, v in raw["rows"].items()}
-        upd = datetime.fromisoformat(raw["updated_at"]) if raw.get("updated_at") else None
-        return region, upd, set(raw["commodities"]), datetime.fromisoformat(raw["fetched_at"])
+        return region, _dt(raw.get("updated_at")), set(raw["commodities"]), _dt(raw["fetched_at"])
 
     def save_region(self, region: dict, updated_at, commodities: set[int], fetched_at: datetime) -> None:
-        raw = {
+        self._write("region.json", {
             "fetched_at": fetched_at.isoformat(),
             "updated_at": updated_at.isoformat() if updated_at else None,
             "commodities": sorted(commodities),
-            "rows": {
-                _key(k): [r.name, r.market_value, r.avg_sale_price, r.sale_rate, r.sold_per_day]
-                for k, r in region.items()
-            },
-        }
-        (self.root / "region.json").write_text(json.dumps(raw, separators=(",", ":")))
+            "rows": {_key(k): [r.name, r.market_value, r.avg_sale_price, r.sale_rate, r.sold_per_day] for k, r in region.items()},
+        })
+
+    # ---- sent deals --------------------------------------------------------
+    def load_sent(self) -> dict[str, str]:
+        return self._read("sent.json") or {}
+
+    def save_sent(self, sent: dict[str, str]) -> None:
+        self._write("sent.json", sent)

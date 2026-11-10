@@ -1,8 +1,9 @@
 """Hourly entry point: python -m tsm_deals [--config config.json] [--dry-run]
 
 Env:
-  DISCORD_WEBHOOK_URL  post the report to this Discord channel webhook (optional)
-  GITHUB_STEP_SUMMARY  set by GitHub Actions; the report is also written there
+  BLIZZARD_CLIENT_ID, BLIZZARD_CLIENT_SECRET  free API client from develop.battle.net (required)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID         where to send deals (optional; otherwise print only)
+  GITHUB_STEP_SUMMARY                          set by GitHub Actions; report is written there too
 """
 
 from __future__ import annotations
@@ -15,12 +16,14 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .cache import SnapshotCache
-from .data import FetchError, TSMClient, load_auction_houses, rate_limited
+from .blizzard import Blizzard
+from .cache import StateCache
+from .data import FetchError, TSMRegion
 from .engine import Config, SellOption, buy_thresholds, find_deals
-from .report import markdown, send_discord
+from .report import markdown, send_telegram, telegram_messages
 
 ROOT = Path(__file__).resolve().parent.parent
+MAX_ITEM_LOOKUPS = 400
 
 
 def load_config(path: Path) -> Config:
@@ -35,156 +38,176 @@ def load_config(path: Path) -> Config:
 def age(ts: datetime | None, now: datetime) -> str:
     if ts is None:
         return "?"
-    return f"{(now - ts).total_seconds() / 3600:.1f}h"
-
-
-def load_sent(path: Path, now: datetime, hours: float) -> dict[str, str]:
-    try:
-        sent = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    cutoff = now - timedelta(hours=hours)
-    return {k: v for k, v in sent.items() if datetime.fromisoformat(v) > cutoff}
+    mins = (now - ts).total_seconds() / 60
+    return f"{mins:.0f}m" if mins < 120 else f"{mins / 60:.1f}h"
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--realms", default=str(ROOT / "data" / "us_realms.json"))
     ap.add_argument("--state", default=str(ROOT / "state"), help="cache + sent-deal history directory")
-    ap.add_argument("--dry-run", action="store_true", help="print only; no Discord, no sent-history update")
+    ap.add_argument("--dry-run", action="store_true", help="print only; no Telegram, no sent-history update")
     args = ap.parse_args(argv)
 
     cfg = load_config(Path(args.config))
     now = datetime.now(timezone.utc)
-    state = Path(args.state)
-    cache = SnapshotCache(state)
-    ahs = load_auction_houses(Path(args.realms))
-    by_slug = {s: ah for ah in ahs for s in ah.slugs}
-    client = TSMClient(cfg.region, cfg.concurrency)
-    max_age = timedelta(hours=cfg.max_data_age_hours)
+    cache = StateCache(Path(args.state))
+    notes: list[str] = []
     errors: dict[str, str] = {}
-    budget = cfg.max_downloads_per_run
-    per_ah = len(cfg.kinds)
+
+    cid, secret = os.environ.get("BLIZZARD_CLIENT_ID", ""), os.environ.get("BLIZZARD_CLIENT_SECRET", "")
+    if not cid or not secret:
+        raise SystemExit("Set BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET (free at develop.battle.net).")
+    bz = Blizzard(cfg.region, cid, secret, cfg.concurrency)
 
     def stale(fetched: datetime | None, hours: float) -> bool:
         return fetched is None or now - fetched > timedelta(hours=hours)
 
-    # 1) Region sales stats + commodity list (refreshed daily upstream).
+    # 1) Connected realms + population (changes rarely).
+    ahs, fetched = cache.load_realms()
+    if ahs is None or stale(fetched, cfg.realm_list_refresh_hours):
+        print("Loading connected-realm list from Blizzard...", file=sys.stderr, flush=True)
+        ahs = bz.connected_realms()
+        cache.save_realms(ahs, now)
+    by_slug = {s: ah for ah in ahs for s in ah.slugs}
+
+    # 2) Region demand stats from TSM (what actually sells, how often).
     cached = cache.load_region()
     if cached is None or stale(cached[3], cfg.region_refresh_hours):
         try:
-            print("Downloading region sales data + commodity list...", file=sys.stderr, flush=True)
-            region, region_ts = client.region(cfg.kinds)
-            commodity_ids = client.commodity_ids()
+            print("Downloading TSM region sales stats...", file=sys.stderr, flush=True)
+            tsm = TSMRegion(cfg.region)
+            region, region_ts = tsm.region(cfg.kinds)
+            commodity_ids = tsm.commodity_ids()
             cache.save_region(region, region_ts, commodity_ids, now)
-            budget -= per_ah + 1
         except FetchError as exc:
             if cached is None:
-                raise SystemExit(f"No region data available: {exc}")
-            errors["region"] = str(exc)
+                raise SystemExit(f"No TSM region data available: {exc}")
+            notes.append(f"TSM region stats refresh failed; using cached copy ({exc}).")
             region, region_ts, commodity_ids, _ = cached
     else:
         region, region_ts, commodity_ids, _ = cached
 
-    # 2) Sell realms: full snapshots (we need their current lowest price for every item).
-    sell_ahs = []
+    # 3) Which auction houses we sell on: configured priority list, then any FULL realm.
+    sell_list: list[tuple[str, object]] = []
     for slug in cfg.sell_realms:
         if slug not in by_slug:
             raise SystemExit(f"Unknown sell realm slug: {slug}")
-        if all(by_slug[slug] is not ah for _, ah in sell_ahs):
-            sell_ahs.append((slug, by_slug[slug]))
-    sell_slugs = {ah.slug for _, ah in sell_ahs}
-    due = sorted(
-        (ah for _, ah in sell_ahs if stale(cache.fetched_at(ah.slug), cfg.sell_refresh_hours)),
-        key=lambda ah: cache.fetched_at(ah.slug) or datetime.min.replace(tzinfo=timezone.utc),
-    )[: max(0, budget // per_ah)]
-    if due:
-        print(f"Downloading {len(due)} sell-realm auction houses...", file=sys.stderr, flush=True)
-        got, errs = client.realms(due, cfg.kinds)
-        errors.update(errs)
-        for slug, snap in got.items():
-            cache.save_ah(slug, snap, now)
-        budget -= per_ah * len(due)
-    sell_snaps = {ah.slug: cache.load_ah(ah.slug) for _, ah in sell_ahs}
-    sells = [
-        SellOption(ah=ah, realm_slug=slug, tier=0 if i == 0 else 1, snap=sell_snaps[ah.slug])
-        for i, (slug, ah) in enumerate(sell_ahs)
-        if sell_snaps[ah.slug] is not None
-    ]
-
-    # 3) Source realms: oldest first, within what is left of the budget. Only rows cheap
-    #    enough to possibly be a deal are stored.
-    thresholds = buy_thresholds(region, sells, commodity_ids, cfg)
+        if all(by_slug[slug] is not a for _, a in sell_list):
+            sell_list.append((slug, by_slug[slug]))
+    if cfg.include_full_realms:
+        for ah in sorted(ahs, key=lambda a: a.display()):
+            if ah.population.upper() == "FULL" and all(ah is not a for _, a in sell_list):
+                sell_list.append((ah.realms[0]["slug"], ah))
+    sell_ids = {a.slug for _, a in sell_list}
     sources_wanted = [by_slug[s] for s in cfg.source_realms] if cfg.source_realms else ahs
-    rotating = [ah for ah in sources_wanted if ah.slug not in sell_slugs]
-    rotating.sort(key=lambda ah: cache.fetched_at(ah.slug) or datetime.min.replace(tzinfo=timezone.utc))
-    due = [ah for ah in rotating if stale(cache.fetched_at(ah.slug), cfg.source_refresh_hours)]
-    due = due[: max(0, budget // per_ah)] if not rate_limited() else []
-    if due:
-        print(f"Downloading {len(due)} source auction houses ({len(thresholds)} items in play)...", file=sys.stderr, flush=True)
-        # keep a margin so cached rows stay useful as prices drift between refreshes
-        keep = lambda key, mb: 0 < mb <= min(cfg.max_buy, int(thresholds.get(key, 0) * 1.5))  # noqa: E731
-        got, errs = client.realms(due, cfg.kinds, keep)
-        errors.update(errs)
-        for slug, snap in got.items():
-            cache.save_ah(slug, snap, now)
 
-    sources = {}
-    oldest = None
-    for ah in sources_wanted:
-        snap = sell_snaps.get(ah.slug) if ah.slug in sell_slugs else cache.load_ah(ah.slug)
+    # 4) Hourly auctions for every AH; unchanged ones answer 304 and we reuse the cache.
+    thresholds = buy_thresholds(region, commodity_ids, cfg)
+    keep = lambda key, mb: 0 < mb <= thresholds.get(key, 0)  # noqa: E731
+
+    def cache_name(ah) -> str:
+        return f"full-{ah.slug}" if ah.slug in sell_ids else f"src-{ah.slug}"
+
+    wanted = {a.slug: a for a in sources_wanted} | {a.slug: a for _, a in sell_list}
+    jobs = []
+    for ah in wanted.values():
+        old = cache.load_ah(cache_name(ah))
+        jobs.append((ah, old.updated_at if old else None, None if ah.slug in sell_ids else keep))
+    print(f"Fetching auctions for {len(jobs)} auction houses ({len(sell_ids)} sell realms)...", file=sys.stderr, flush=True)
+    results, errs = bz.auctions_many(jobs)
+    errors.update(errs)
+    for ah in wanted.values():
+        res = results.get(ah.slug)
+        if res and res[0] is not None:
+            cache.save_ah(cache_name(ah), res[0])
+
+    max_age = timedelta(hours=cfg.max_data_age_hours)
+    snaps, oldest, stale_n = {}, None, 0
+    for ah in wanted.values():
+        snap = cache.load_ah(cache_name(ah))
         if snap is None:
             continue
         if snap.updated_at and now - snap.updated_at > max_age:
-            errors.setdefault(ah.slug, f"stale data ({age(snap.updated_at, now)})")
+            stale_n += 1
             continue
+        snaps[ah.slug] = snap
         if snap.updated_at and (oldest is None or snap.updated_at < oldest):
             oldest = snap.updated_at
-        sources[ah.slug] = (ah, snap)
-    sells = [s for s in sells if not (s.snap.updated_at and now - s.snap.updated_at > max_age)]
+    if stale_n:
+        notes.append(f"{stale_n} realms skipped: Blizzard data older than {cfg.max_data_age_hours:g}h.")
+    if errors:
+        notes.append(f"{len(errors)} realms failed to download this hour.")
+
+    sells = [
+        SellOption(ah=a, realm_slug=slug, tier=0 if i == 0 else 1, snap=snaps[a.slug])
+        for i, (slug, a) in enumerate(sell_list)
+        if a.slug in snaps
+    ]
     if not sells:
         raise SystemExit(f"No fresh sell-realm data. Errors: {errors}")
+    sources = {a.slug: (a, snaps[a.slug]) for a in sources_wanted if a.slug in snaps}
 
+    # 5) Deals, then drop gear (weapons, armor, profession equipment) via Blizzard item class.
     deals = find_deals(region, sells, sources, commodity_ids, cfg)
+    items = cache.load_items()
+    lookups = unknown = 0
+    kept = []
+    excluded = set(cfg.exclude_item_classes)
+    for d in deals:
+        if d.kind == "item":
+            info = items.get(str(d.id))
+            if info is None and lookups < MAX_ITEM_LOOKUPS:
+                lookups += 1
+                try:
+                    info = items[str(d.id)] = bz.item_info(d.id)
+                except FetchError:
+                    info = None
+            if info is None:
+                unknown += 1  # fail closed: never send something that might be gear
+                continue
+            if info.get("class_id") in excluded:
+                continue
+            d.name = info.get("name") or d.name
+            d.item_class = info.get("class") or ""
+        kept.append(d)
+    cache.save_items(items)
+    if unknown:
+        notes.append(f"{unknown} candidate items skipped: item type lookup unavailable.")
 
-    sent_path = state / "sent.json"
-    sent = load_sent(sent_path, now, cfg.dedupe_hours)
-    fresh = [d for d in deals if d.dedupe_key not in sent][: cfg.max_results]
+    sent = {k: v for k, v in cache.load_sent().items() if datetime.fromisoformat(v) > now - timedelta(hours=cfg.dedupe_hours)}
+    fresh = [d for d in kept if d.dedupe_key not in sent][: cfg.max_results]
 
     stats = {
         "realm_age": age(oldest, now),
-        "region_age": age(region_ts, now),
         "ahs_scanned": len(sources),
         "ahs_total": len(sources_wanted),
-        "errors": errors,
-        "rate_limited": rate_limited(),
+        "notes": notes,
     }
-    report = markdown(fresh, stats, now)
-    print(report)
+    print(markdown(fresh, stats, now))
     print(
-        f"\n[{len(deals)} qualifying deals, {len(fresh)} new after dedupe; "
-        f"{len(sources)}/{len(sources_wanted)} AHs with data; errors: {errors}]",
+        f"\n[{len(deals)} candidates, {len(kept)} after gear filter, {len(fresh)} new; "
+        f"sell realms: {[s.display for s in sells]}; errors: {errors}]",
         file=sys.stderr,
     )
-
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as fh:
-            fh.write(report + "\n")
+            fh.write(markdown(fresh, stats, now) + "\n")
 
     if args.dry_run:
         return 0
 
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    if webhook and fresh:
-        send_discord(webhook, report)
-    elif not webhook:
-        print("DISCORD_WEBHOOK_URL not set; report only printed.", file=sys.stderr)
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if token and chat:
+        if fresh:
+            send_telegram(token, chat, telegram_messages(fresh, stats, now))
+    else:
+        print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; report only printed.", file=sys.stderr)
 
     for d in fresh:
         sent[d.dedupe_key] = now.isoformat()
-    sent_path.write_text(json.dumps(sent, indent=0, sort_keys=True))
+    cache.save_sent(sent)
     return 0
 
 

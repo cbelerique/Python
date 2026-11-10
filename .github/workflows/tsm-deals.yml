@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["tsm_deals/**", "tests/**", "config.json", "data/**", ".github/workflows/tsm-deals.yml"]
+    paths: ["tsm_deals/**", "tests/**", "config.json", ".github/workflows/tsm-deals.yml"]
   pull_request:
 
 permissions:
@@ -37,8 +37,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Remembers which deals were already sent so you are not pinged with the same one every hour.
-      - name: Restore sent-deal history
+      # Auction snapshots, realm list, item types and already-sent deals, kept between runs.
+      - name: Restore state
         uses: actions/cache/restore@v4
         with:
           path: state
@@ -47,10 +47,13 @@ jobs:
 
       - name: Scan
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
+          BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -m tsm_deals
 
-      - name: Save sent-deal history
+      - name: Save state
         if: always()
         uses: actions/cache/save@v4
         with:

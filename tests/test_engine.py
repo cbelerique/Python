@@ -1,21 +1,24 @@
 import unittest
 
-from tsm_deals.data import AuctionHouse, RealmRow, RegionRow, Snapshot, parse_realm_csv, parse_region_csv
+from tsm_deals.blizzard import snapshot_from_auctions
+from tsm_deals.data import AuctionHouse, RealmRow, RegionRow, Snapshot, parse_region_csv
 from tsm_deals.engine import Config, SellOption, find_deals, list_price
 from tsm_deals.report import gold, markdown
 
 G = 10_000  # copper per gold
 
 
+_ids = iter(range(1, 10_000))
+
+
 def ah(slug):
-    return AuctionHouse([{"slug": slug, "name": slug.title()}])
+    return AuctionHouse(next(_ids), [{"slug": slug, "name": slug.title()}])
 
 
 def snap(rows):
     s = Snapshot()
     for key, mb in rows.items():
-        s.rows[key] = RealmRow(min_buyout=mb, market_value=mb)
-        s.names[key] = f"Thing {key[1]}"
+        s.rows[key] = RealmRow(min_buyout=mb, count=1)
     return s
 
 
@@ -51,7 +54,7 @@ class Deals(unittest.TestCase):
         self.assertEqual(len(deals), 1)
         d = deals[0]
         self.assertEqual(d.sell.realm_slug, "illidan")
-        self.assertEqual(d.buy_ah.slug, "small-realm")
+        self.assertIs(d.buy_ah, SMALL)
         self.assertEqual(d.net, 950 * G)
         self.assertFalse(d.same_realm)
 
@@ -81,10 +84,10 @@ class Deals(unittest.TestCase):
         deals = find_deals(REGION, sells({KEY: 100 * G}, {}), sources, set(), self.cfg)
         self.assertEqual(deals[0].sell.realm_slug, "area-52")
 
-    def test_same_realm_flip_priced_off_market_value(self):
+    def test_same_realm_flip_priced_off_second_listing(self):
         # Illidan's lowest listing is 50g but it normally trades ~1000g: buy it and relist there.
         ill = Snapshot()
-        ill.rows[KEY] = RealmRow(min_buyout=50 * G, market_value=1000 * G)
+        ill.rows[KEY] = RealmRow(min_buyout=50 * G, next_buyout=1000 * G)
         cfg = Config(sell_realms=["illidan"])
         s = [SellOption(ILLIDAN, "illidan", 0, ill)]
         deals = find_deals(REGION, s, {"illidan": (ILLIDAN, ill)}, set(), cfg)
@@ -97,8 +100,8 @@ class Deals(unittest.TestCase):
         region = dict(REGION)
         region[k2] = RegionRow("Other", 1000 * G, 1000 * G, 0.9, 10)  # faster seller
         ill = Snapshot()
-        ill.rows[KEY] = RealmRow(min_buyout=40 * G, market_value=1000 * G)
-        ill.rows[k2] = RealmRow(min_buyout=40 * G, market_value=1000 * G)
+        ill.rows[KEY] = RealmRow(min_buyout=40 * G, next_buyout=1000 * G)
+        ill.rows[k2] = RealmRow(min_buyout=40 * G, next_buyout=1000 * G)
         sources = {"illidan": (ILLIDAN, ill), "small-realm": (SMALL, snap({KEY: 60 * G}))}
         cfg = Config(sell_realms=["illidan"])
         deals = find_deals(region, [SellOption(ILLIDAN, "illidan", 0, ill)], sources, set(), cfg)
@@ -115,7 +118,7 @@ class Deals(unittest.TestCase):
         region = dict(REGION)
         region[k2] = RegionRow("Other", 1000 * G, 1000 * G, 0.9, 10)
         ill = Snapshot()
-        ill.rows[k2] = RealmRow(min_buyout=40 * G, market_value=1000 * G)
+        ill.rows[k2] = RealmRow(min_buyout=40 * G, next_buyout=1000 * G)
         sources = {"illidan": (ILLIDAN, ill), "small-realm": (SMALL, snap({KEY: 60 * G}))}
         cfg = Config(sell_realms=["illidan"])
         deals = find_deals(region, [SellOption(ILLIDAN, "illidan", 0, ill)], sources, set(), cfg)
@@ -134,8 +137,8 @@ class Deals(unittest.TestCase):
         from datetime import datetime, timezone
 
         text = markdown(deals, {"ahs_scanned": 3}, datetime.now(timezone.utc))
-        self.assertIn("BUY on **Small-Realm** for **100g**", text)
-        self.assertIn("SELL on **Illidan**", text)
+        self.assertIn("BUY on **Small-Realm for 100g**", text)
+        self.assertIn("SELL on **Illidan at", text)
         self.assertIn("i:100", text)
         self.assertEqual(gold(12_345), "1.23g")
 
@@ -152,24 +155,23 @@ class VariantGuard(unittest.TestCase):
 
 
 class Parsing(unittest.TestCase):
-    def test_parse_real_headers(self):
-        s = Snapshot()
-        parse_realm_csv(
-            "itemId,name,marketValue,minBuyout,recent,historical,updatedAt\n"
-            "60854,Loot-A-Rang,19941634,19941200,19941200,19996783,2026-11-09T23:22:46Z\n",
-            "item",
-            s,
-        )
-        parse_realm_csv(
-            "petSpeciesId,name,marketValue,minBuyout,recent,historical,updatedAt\n"
-            "3530,Miloh,791967612,750000000,750000000,816000000,2026-11-09T23:22:46Z\n",
-            "pet",
-            s,
-        )
-        self.assertEqual(s.rows[("item", 60854)].min_buyout, 19941200)
-        self.assertEqual(s.rows[("pet", 3530)].min_buyout, 750000000)
-        self.assertIsNotNone(s.updated_at)
+    def test_blizzard_auctions_to_snapshot(self):
+        payload = {"auctions": [
+            {"id": 1, "item": {"id": 500}, "buyout": 3000, "quantity": 1},
+            {"id": 2, "item": {"id": 500}, "buyout": 1000, "quantity": 1},
+            {"id": 3, "item": {"id": 500}, "buyout": 2000, "quantity": 1},
+            {"id": 4, "item": {"id": 600}, "bid": 5, "quantity": 1},  # bid-only: ignored
+            {"id": 5, "item": {"id": 700}, "buyout": 900, "quantity": 3},  # stack: unit 300
+            {"id": 6, "item": {"id": 82800, "pet_species_id": 3530, "pet_level": 1}, "buyout": 7000, "quantity": 1},
+        ]}
+        s = snapshot_from_auctions(payload)
+        self.assertEqual(s.rows[("item", 500)], RealmRow(1000, 2000, 3))
+        self.assertNotIn(("item", 600), s.rows)
+        self.assertEqual(s.rows[("item", 700)].min_buyout, 300)
+        self.assertEqual(s.rows[("pet", 3530)].min_buyout, 7000)
+        self.assertNotIn(("item", 82800), s.rows)
 
+    def test_region_csv(self):
         region = {}
         parse_region_csv(
             "itemId,name,marketValue,historical,avgSalePrice,saleRate,soldPerDay,updatedAt\n"

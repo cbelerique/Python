@@ -26,18 +26,19 @@ class Config:
     min_profit_gold: float = 25
     min_sale_rate: float = 0.05
     min_sold_per_day: float = 0.25
-    max_data_age_hours: float = 8
+    max_data_age_hours: float = 2
     include_pets: bool = True
     include_same_realm: bool = True
+    # Blizzard item class ids to skip: 2 Weapon, 4 Armor, 19 Profession equipment
+    exclude_item_classes: list[int] = field(default_factory=lambda: [2, 4, 19])
     sell_realms: list[str] = field(default_factory=lambda: ["illidan"])
+    include_full_realms: bool = True  # also sell on any realm Blizzard reports as FULL
     source_realms: list[str] = field(default_factory=list)
     max_results: int = 25
     dedupe_hours: float = 6
-    concurrency: int = 2
-    max_downloads_per_run: int = 60
+    concurrency: int = 4
     region_refresh_hours: float = 6
-    sell_refresh_hours: float = 2
-    source_refresh_hours: float = 2
+    realm_list_refresh_hours: float = 24
 
     @property
     def max_buy(self) -> int:
@@ -56,7 +57,7 @@ class Config:
 class SellOption:
     ah: AuctionHouse
     realm_slug: str  # the configured full realm (e.g. "illidan")
-    tier: int  # 0 = top priority realm, 1 = other full realms
+    tier: int  # 0 = top priority realm (Illidan), 1 = other full realms
     snap: Snapshot
 
     @property
@@ -81,6 +82,8 @@ class Deal:
     avg_sale_price: int
     same_realm: bool
     other_sources: list[tuple[AuctionHouse, int]] = field(default_factory=list)
+    sell_listed: int = 0  # listings already on the sell realm (competition)
+    item_class: str = ""
     cheap_on_full_realms: int = 0  # other full realms listing it at a deal price -> variant risk
     alt_sells: list[tuple[str, int]] = field(default_factory=list)
 
@@ -141,16 +144,16 @@ def passes_demand(region: RegionRow | None, cfg: Config) -> bool:
     )
 
 
-def buy_thresholds(region: dict, sells: list[SellOption], commodity_ids: set[int], cfg: Config) -> dict:
-    """Highest buy price worth keeping per item, so source realm files can be filtered on load."""
+def buy_thresholds(region: dict, commodity_ids: set[int], cfg: Config) -> dict:
+    """Highest buy price worth keeping per item (from region signals only), so source realm
+    data can be filtered as it is loaded. Sell-realm prices can only lower the real cap."""
     out: dict[tuple[str, int], int] = {}
     for key, r in region.items():
         if key[0] not in cfg.kinds or not passes_demand(r, cfg):
             continue
         if key[0] == "item" and key[1] in commodity_ids:
             continue
-        # Upper bound over every sell realm: price as if nobody were listed (region signals only).
-        best = max_buy_for(net_after_cut(list_price(r, 0, cfg.undercut), cfg.ah_cut), cfg) if sells else 0
+        best = max_buy_for(net_after_cut(list_price(r, 0, cfg.undercut), cfg.ah_cut), cfg)
         if best > 0:
             out[key] = best
     return out
@@ -170,13 +173,10 @@ def find_deals(
     """
     # item -> [(ah, price)] for every source listing under the hard cap
     listings: dict[tuple[str, int], list[tuple[AuctionHouse, int]]] = {}
-    names: dict[tuple[str, int], str] = {}
     for ah, snap in sources.values():
         for key, row in snap.rows.items():
             if 0 < row.min_buyout <= cfg.max_buy:
                 listings.setdefault(key, []).append((ah, row.min_buyout))
-                if key in snap.names:
-                    names.setdefault(key, snap.names[key])
 
     deals: list[Deal] = []
     for key, offers in listings.items():
@@ -193,9 +193,9 @@ def find_deals(
         for s in sells:
             row = s.snap.rows.get(key)
             cross_price = list_price(r, row.min_buyout if row else 0, cfg.undercut, median)
-            # Same-realm flip: the realm's lowest listing IS the one we'd buy, so price the
-            # resale off the realm's market value instead of that listing.
-            same_price = list_price(r, row.market_value if row else 0, cfg.undercut, median)
+            # Same-realm flip: the realm's lowest listing IS the one we'd buy, so the
+            # competition is the second-cheapest listing.
+            same_price = list_price(r, row.next_buyout if row else 0, cfg.undercut, median)
             ok = []
             for ah, p in offers:
                 same = ah.slug == s.ah.slug
@@ -217,7 +217,7 @@ def find_deals(
             chosen = Deal(
                 kind=kind,
                 id=item_id,
-                name=names.get(key) or r.name or f"{kind} {item_id}",
+                name=r.name or f"{kind} {item_id}",
                 buy_ah=buy_ah,
                 buy_price=buy,
                 sell=s,
@@ -231,6 +231,7 @@ def find_deals(
                 same_realm=buy_ah.slug == s.ah.slug,
                 other_sources=[(o[0], o[1]) for o in sorted(ok[1:], key=lambda o: o[1])[:3]],
                 cheap_on_full_realms=cheap_full,
+                sell_listed=row.count if row else 0,
             )
         if chosen:
             chosen.alt_sells = alt_sells[:2]

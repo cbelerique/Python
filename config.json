@@ -7,9 +7,10 @@
   "min_profit_gold": 25,
   "min_sale_rate": 0.05,
   "min_sold_per_day": 0.25,
-  "max_data_age_hours": 8,
+  "max_data_age_hours": 2,
   "include_pets": true,
   "include_same_realm": true,
+  "exclude_item_classes": [2, 4, 19],
   "sell_realms": [
     "illidan",
     "area-52",
@@ -26,16 +27,13 @@
     "kelthuzad",
     "emerald-dream",
     "wyrmrest-accord",
-    "hyjal",
-    "frostmourne",
-    "barthilas"
+    "hyjal"
   ],
+  "include_full_realms": true,
   "source_realms": [],
   "max_results": 25,
   "dedupe_hours": 6,
-  "concurrency": 2,
-  "max_downloads_per_run": 60,
+  "concurrency": 4,
   "region_refresh_hours": 6,
-  "sell_refresh_hours": 2,
-  "source_refresh_hours": 2
+  "realm_list_refresh_hours": 24
 }
