@@ -51,7 +51,7 @@ them into TSM → Groups → Import to shop them.
    repository secret* and add `BLIZZARD_CLIENT_ID`, `BLIZZARD_CLIENT_SECRET`,
    `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 4. **Turn it on.** GitHub only runs scheduled workflows from the default branch, so merge into
-   `main`. Then go to Actions → *TSM deal scan* → *Run workflow* to test right away. It then runs
+   `master`. Then go to Actions → *TSM deal scan* → *Run workflow* to test right away. It then runs
    at minute 17 of every hour. Every run also writes its report to the Actions run summary.
 
 ## Run locally
